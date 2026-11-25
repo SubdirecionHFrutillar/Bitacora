@@ -1,0 +1,12 @@
+{
+  "name": "Bitácora de Ambulancia · Hospital de Frutillar",
+  "short_name": "Bitácora",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#F2F5F9",
+  "theme_color": "#0F69C4",
+  "icons": [
+    { "src": "../icons/ambulancia-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "../icons/ambulancia-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
