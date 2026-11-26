@@ -79,7 +79,8 @@ python3 scripts/build.py --publicar ../Bitacora   # copia dist/bitacora/ a <repo
 - `scripts/test/gas-simulado.mjs` carga el `Código.gs` real con una planilla en memoria. Limitación: Node atiende un
   pedido a la vez, así que la concurrencia real (LockService) solo se prueba en Google.
 - No editar `dist/` ni la carpeta publicada a mano: se regeneran.
-- La versión anterior (Apps Script + `Index.html` con Babel en la tablet) está en la etiqueta git `apps-script-final`.
+- La versión anterior (Apps Script + `Index.html` con Babel en la tablet) es el commit `bcc0fa8` de la rama `app-fuente`
+  ("Estado actual: Código.gs, Index.html…"): `git show bcc0fa8:apps-script/Index.html`.
 
 ## Publicar un cambio
 
