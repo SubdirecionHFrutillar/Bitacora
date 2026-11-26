@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#0F69C4"/>
+  <!-- luz -->
+  <rect x="150" y="120" width="56" height="34" rx="10" fill="#EB3C46"/>
+  <!-- carrocería -->
+  <path d="M64 150h236v40h60c12 0 22 5 30 14l50 60c7 8 10 18 10 28v74c0 14-11 24-24 24H88c-13 0-24-10-24-24z" fill="#fff"/>
+  <!-- ventana cabina -->
+  <path d="M318 214h38l46 54h-84z" fill="#BFD9F2"/>
+  <!-- cruz -->
+  <rect x="152" y="196" width="40" height="120" rx="6" fill="#EB3C46"/>
+  <rect x="112" y="236" width="120" height="40" rx="6" fill="#EB3C46"/>
+  <!-- ruedas -->
+  <circle cx="148" cy="392" r="42" fill="#001C41"/><circle cx="148" cy="392" r="16" fill="#fff"/>
+  <circle cx="364" cy="392" r="42" fill="#001C41"/><circle cx="364" cy="392" r="16" fill="#fff"/>
+</svg>

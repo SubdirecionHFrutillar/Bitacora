@@ -1,7 +1,7 @@
 const { useState, useEffect, useRef, useMemo, createContext, useContext } = React;
 const __L = window.LucideReact || {};
 const __stub = () => null;
-const { Ambulance = __stub, Sun = __stub, Moon = __stub, Plus = __stub, Check = __stub, X = __stub, AlertTriangle = __stub, Clock = __stub, Copy = __stub, Download = __stub, Users = __stub, RefreshCw = __stub, CloudOff = __stub, Cloud = __stub, Pencil = __stub, Ban = __stub, ChevronDown = __stub, ChevronUp = __stub, FileText = __stub, Route = __stub, Gauge = __stub } = __L;
+const { Ambulance = __stub, Sun = __stub, Moon = __stub, Plus = __stub, Check = __stub, X = __stub, AlertTriangle = __stub, Clock = __stub, Copy = __stub, Download = __stub, Users = __stub, RefreshCw = __stub, CloudOff = __stub, Cloud = __stub, Pencil = __stub, Ban = __stub, ChevronDown = __stub, ChevronUp = __stub, FileText = __stub, Route = __stub, Gauge = __stub, KeyRound = __stub } = __L;
 
 /* ==================================================================
    PILOTO · BITÁCORA DIGITAL DE TRASLADOS — HOSPITAL DE FRUTILLAR
@@ -83,9 +83,44 @@ function borrarTurno() { try { localStorage.removeItem(TURNO_KEY); } catch (e) {
 const normalizarNombre = (x) => String(x).replace(/\s+/g, ' ').trim().toLowerCase().replace(/(^|[\s'-])([a-záéíóúüñ])/g, (m, sep, l) => sep + l.toUpperCase());
 const claveNombre = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
-/* ---------------- conexión con Apps Script ---------------- */
-const hayServidor = () => typeof google !== 'undefined' && google.script && google.script.run;
-const gas = (fn, ...args) => new Promise((res, rej) => { google.script.run.withSuccessHandler(res).withFailureHandler(rej)[fn](...args); });
+/* ---------------- conexión con la planilla (Apps Script · doPost) ----------------
+   API_URL: URL /exec de la implementación con acceso "Cualquier usuario". Vacía = modo demo (vista previa).
+   El token de la tablet NUNCA va en el código: se pega una vez o llega por enlace/QR (#t=…) y queda en la tablet.
+   Se envía como text/plain para que el navegador no haga "preflight" CORS (Apps Script no lo responde). */
+const API_URL = '%API_URL%';
+const VERSION = '%VERSION%';
+const TOKEN_KEY = 'hf-bitacora-token';
+const TIEMPO_MAX_MS = 60000;
+/* App anterior (Apps Script con google.script.run). Solo para vaciar registros pendientes durante el cambio de tablets.
+   Borrar este enlace cuando todas las tablets estén migradas. */
+const APP_ANTERIOR_URL = 'https://script.google.com/macros/s/AKfycbywLLGOuY8RtpOkMwHjSjBzMqoz-aB3maO1_KDFgAlR99MAJ04rvaxFmHmV8njOG0ONsA/exec';
+function leerToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } }
+function guardarToken(x) { try { localStorage.setItem(TOKEN_KEY, x); return true; } catch (e) { return false; } }
+function borrarToken() { try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* sin almacenamiento */ } }
+const hayServidor = () => !!(API_URL && !API_URL.startsWith('%') && leerToken());
+class ErrorServidor extends Error { constructor(msg, codigo) { super(msg); this.codigo = codigo; } }
+/* Un pedido solo se da por bueno si vuelve JSON con { data }. Sin respuesta, respuesta HTML de Google o error → se
+   rechaza y la cola se reintenta más tarde (los evento_id son idempotentes: reenviar no duplica). */
+const gas = async (fn, ...args) => {
+  const token = leerToken();
+  if (!hayServidor()) throw new ErrorServidor('Falta configurar el token de esta tablet', 'SIN_TOKEN');
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const reloj = ctl ? setTimeout(() => ctl.abort(), TIEMPO_MAX_MS) : null;
+  let r;
+  try {
+    r = await fetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, cache: 'no-store', redirect: 'follow',
+      body: JSON.stringify({ fn, args, token, dispositivo: dispositivoId(), version: VERSION }), signal: ctl ? ctl.signal : undefined });
+  } catch (e) { throw new ErrorServidor('Sin conexión con la planilla. Se reintentará.', 'RED'); }
+  finally { if (reloj) clearTimeout(reloj); }
+  let j = null;
+  try { j = JSON.parse(await r.text()); } catch (e) { throw new ErrorServidor('Respuesta no válida de la planilla. Se reintentará.', 'RESPUESTA'); }
+  if (j && j.error) {
+    if (j.codigo === 'TOKEN_INVALIDO') { try { window.dispatchEvent(new Event('hf-token-invalido')); } catch (e) { /* */ } }
+    throw new ErrorServidor(j.error, j.codigo || 'ERROR');
+  }
+  if (!j || !Object.prototype.hasOwnProperty.call(j, 'data')) throw new ErrorServidor('Respuesta incompleta de la planilla. Se reintentará.', 'RESPUESTA');
+  return j.data;
+};
 
 async function copiarTexto(texto) {
   try { await navigator.clipboard.writeText(texto); return true; } catch (e) { /* fallback */ }
@@ -785,7 +820,7 @@ function TodosDelDia({ fecha, todos, registrar, usuario, dispositivo, online, to
   );
 }
 
-function Resumen({ st, toast, setModal, todos, registrar, dispositivo, online, aplicarAnulados, turno }) {
+function Resumen({ st, toast, setModal, todos, registrar, dispositivo, online, aplicarAnulados, turno, pendientes, onCambiarToken }) {
   const t = useT();
   const [fecha, setFecha] = useState(fechaLocal());
   const r = useMemo(() => calcularDia(st.traslados, fecha), [st.traslados, fecha]);
@@ -840,6 +875,16 @@ function Resumen({ st, toast, setModal, todos, registrar, dispositivo, online, a
         <details className="mt-3"><summary className="font-bold cursor-pointer min-h-[48px] flex items-center">Vista previa</summary>
           <pre className={`${t.soft} rounded-md p-3 text-sm whitespace-pre-wrap`}>{texto}</pre></details>
       </Card>
+
+      {onCambiarToken && (
+        <Card title="Esta tablet" icon={KeyRound}>
+          <p className={`text-sm ${t.muted}`}>Equipo {dispositivo} · versión {VERSION} · {pendientes} registro(s) por enviar</p>
+          <details className="mt-2"><summary className="font-bold cursor-pointer min-h-[48px] flex items-center">Cambiar token (solo administrador)</summary>
+            <p className="text-sm mb-2">Úselo solo si el administrador entregó un token nuevo para esta tablet. Los registros por enviar se conservan.</p>
+            <Btn icon={KeyRound} onClick={() => { if (window.confirm('¿Cambiar el token de esta tablet? Tendrá que pegar o escanear el token nuevo.')) onCambiarToken(); }}>Cambiar token</Btn>
+          </details>
+        </Card>
+      )}
     </>
   );
 }
@@ -921,7 +966,7 @@ function TurnoEquipo({ turno, draft, setDraft, onConfirmar, onCambiar, cfg, ulti
 /* ==================================================================
    APP
    ================================================================== */
-function App() {
+function App({ onCambiarToken }) {
   const [st, setSt] = useState(() => cargarLS(STORE, null) || (hayServidor() ? { ...demo(), traslados: [], abierto: null, usuario: '', tripulacion: { conductor: '', tens: '', medico: '' } } : demo()));
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine !== false);
   const [sync, setSync] = useState({ estado: hayServidor() ? 'listo' : 'demo', msg: '' });
@@ -983,11 +1028,16 @@ function App() {
   useEffect(() => { if (!msg) return; const i = setTimeout(() => setMsg(null), 3500); return () => clearTimeout(i); }, [msg]);
 
   /* Cargar personal, destinos y último km desde la planilla */
-  useEffect(() => {
+  const cargarConfig = () => {
     if (!hayServidor()) return;
-    gas('getConfig').then((c) => { setSt((s) => ({ ...s, config: { ...DEFAULT_CONFIG, ...c.config }, ultimoKmServidor: c.ultimoKm || {} })); aplicarAnulados(c.anulados); })
-      .catch(() => setSync({ estado: 'error', msg: 'No se pudo leer la configuración' }));
-  }, []);
+    gas('getConfig').then((c) => {
+      setSt((s) => ({ ...s, config: { ...DEFAULT_CONFIG, ...c.config }, ultimoKmServidor: c.ultimoKm || {} })); aplicarAnulados(c.anulados);
+      const desfase = c.serverTime ? Math.round((Date.now() - new Date(c.serverTime).getTime()) / 60000) : 0;   // la hora de cada registro sale de la tablet
+      if (Math.abs(desfase) > 5) setSync({ estado: 'listo', msg: `La hora de esta tablet difiere ${Math.abs(desfase)} min de la planilla. Corrija la fecha y hora del equipo.` });
+    })
+      .catch((e) => { if (e && e.codigo !== 'RED') setSync({ estado: 'error', msg: 'No se pudo leer la configuración' }); });   // sin señal: se usa la última guardada
+  };
+  useEffect(() => { cargarConfig(); window.addEventListener('online', cargarConfig); return () => window.removeEventListener('online', cargarConfig); }, []);
 
   /* Envío de la cola de eventos */
   const enviar = async () => {
@@ -1073,7 +1123,7 @@ function App() {
               <div className="text-[11px] font-bold opacity-80">Servicio de Salud<br />del Reloncaví</div>
               <div className="text-sm font-black">Hospital de Frutillar</div>
             </div>
-            <div className="flex-1 min-w-0"><div className="font-black text-lg leading-tight">Bitácora de Ambulancia</div><div className="text-xs opacity-80">Registro de traslados · piloto</div></div>
+            <div className="flex-1 min-w-0"><div className="font-black text-lg leading-tight">Bitácora de Ambulancia</div><div className="text-xs opacity-80">Registro de traslados · piloto · v{VERSION}</div></div>
             <button type="button" onClick={() => { if (hayServidor()) enviar(); }} className={`${pill.c} text-xs font-bold px-2 py-2 rounded-md flex items-center gap-1 min-h-[44px]`}><pill.i size={14} /><span className="hidden sm:inline">{pill.l}</span><span className="sm:hidden">{sync.estado === 'demo' ? 'Demo' : st.cola.length || '✓'}</span></button>
             <button type="button" onClick={() => setSt((s) => ({ ...s, theme: s.theme === 'day' ? 'night' : 'day' }))} aria-label="Cambiar modo día / noche"
               className={`min-h-[52px] px-3 rounded-md font-black flex items-center gap-1 border-2 ${st.theme === 'day' ? 'bg-white text-[#1B2B44] border-[#7E9BC0]' : 'bg-[#1A2D47] text-[#E3C47E] border-[#5D86BA]'}`}>
@@ -1107,7 +1157,8 @@ function App() {
           )}
           {st.tab === 'moviles' && <Moviles cfg={cfg} todos={st.traslados} online={online} />}
           {st.tab === 'resumen' && <Resumen st={{ ...st, traslados: visibles }} toast={setMsg} setModal={setModal} todos={st.traslados} registrar={registrar}
-            dispositivo={dev.current} online={online} aplicarAnulados={aplicarAnulados} turno={turno ? turnoEvento() : null} />}
+            dispositivo={dev.current} online={online} aplicarAnulados={aplicarAnulados} turno={turno ? turnoEvento() : null}
+            pendientes={st.cola.length} onCambiarToken={onCambiarToken} />}
           {sync.estado === 'demo' && (
             <p className={`text-center text-xs mt-6 ${t.muted}`}>Vista previa con datos de ejemplo. Instalada desde la planilla institucional, los eventos se envían a Google Sheets.
               <button type="button" className="underline ml-1 min-h-[44px]" onClick={() => { setSt(demo()); setMsg('Datos de ejemplo restablecidos'); }}>Restablecer ejemplo</button></p>
@@ -1173,4 +1224,99 @@ function Anular({ tr, onClose, onSave }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+/* ==================================================================
+   ARRANQUE: token de la tablet, service worker y almacenamiento persistente
+   ================================================================== */
+/* Token llegado por enlace o QR: …/bitacora/#t=TOKEN. Se guarda y se borra de la barra de direcciones. */
+function tokenDesdeEnlace() {
+  try {
+    const m = /(?:^#|&)t=([A-Za-z0-9_-]{20,128})/.exec(window.location.hash || '');
+    if (!m) return '';
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    return m[1];
+  } catch (e) { return ''; }
+}
+
+function ConfigurarToken({ aviso, onGuardar }) {
+  const t = THEMES.day;
+  const [valor, setValor] = useState('');
+  const limpio = valor.replace(/\s+/g, '');
+  const valido = /^[A-Za-z0-9_-]{20,128}$/.test(limpio);
+  return (
+    <Th.Provider value={t}>
+      <div className={`${t.page} min-h-screen`} style={{ fontFamily: "gobCL, Roboto, 'Helvetica Neue', Arial, sans-serif" }}>
+        <div className="flex h-2" aria-hidden="true"><div className="w-1/3 bg-[#0F69C4]" /><div className="flex-1 bg-[#EB3C46]" /></div>
+        <main className="max-w-xl mx-auto p-4">
+          <p className="text-sm font-bold opacity-80 mt-4">Servicio de Salud del Reloncaví · Hospital de Frutillar</p>
+          <h1 className="text-3xl font-black mb-4 flex items-center gap-2"><Ambulance size={34} /> Bitácora de Ambulancia</h1>
+          <Card title="Configurar esta tablet" icon={KeyRound}>
+            {aviso && <div className={`${t.warnBox} rounded-md p-3 font-bold mb-3`} role="alert">{aviso}</div>}
+            <p className="mb-3">Esta tablet aún no tiene su token. Escanee el código QR que le entregó el administrador o pegue aquí el token. Se hace una sola vez.</p>
+            <Field label="Token de la tablet">
+              <textarea value={valor} onChange={(e) => setValor(e.target.value)} rows={3} autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                className={`${t.input} w-full rounded-md p-3 text-lg font-mono break-all`} placeholder="Pegue el token aquí" aria-label="Token de la tablet" />
+            </Field>
+            <Btn kind="primary" icon={Check} className="w-full !min-h-[64px] !text-xl" disabled={!valido} onClick={() => onGuardar(limpio)}>Guardar</Btn>
+            <p className={`text-sm mt-3 ${t.muted}`}>Sin token la tablet no envía nada a la planilla. Si no lo tiene, pídalo a Subdirección.</p>
+            {APP_ANTERIOR_URL && <p className="text-sm mt-3">¿Esta tablet tiene registros sin enviar en la app anterior? <a className="underline font-bold" href={APP_ANTERIOR_URL} target="_blank" rel="noopener">Abrir la app anterior</a> con señal y espere a que diga «Sincronizado» antes de configurar esta.</p>}
+            <p className={`text-xs mt-2 ${t.muted}`}>Equipo {dispositivoId()} · versión {VERSION}</p>
+          </Card>
+        </main>
+      </div>
+    </Th.Provider>
+  );
+}
+
+function AvisoVersion({ onActualizar }) {
+  return (
+    <div className="fixed top-3 inset-x-3 z-50 mx-auto max-w-md bg-[#0F69C4] text-white font-bold rounded-md p-3 shadow-2xl border-2 border-white flex items-center gap-3" role="status">
+      <span className="flex-1">Hay una versión nueva de la bitácora.</span>
+      <button type="button" onClick={onActualizar} className="bg-white text-[#0F69C4] font-black rounded-md px-4 min-h-[52px]">Actualizar</button>
+    </div>
+  );
+}
+
+function Raiz() {
+  const conServidor = !!(API_URL && !API_URL.startsWith('%'));
+  const [token, setToken] = useState(() => {
+    const t = tokenDesdeEnlace();
+    if (t) { guardarToken(t); return t; }
+    return leerToken();
+  });
+  const [aviso, setAviso] = useState('');
+  const [swEspera, setSwEspera] = useState(null);
+
+  useEffect(() => {   // token rechazado por el servidor: se borra y se vuelve a pedir
+    const f = () => { borrarToken(); setToken(''); setAviso('El token de esta tablet no es válido o fue revocado. Pida uno nuevo a Subdirección. Los registros por enviar se conservan.'); };
+    window.addEventListener('hf-token-invalido', f);
+    return () => window.removeEventListener('hf-token-invalido', f);
+  }, []);
+
+  useEffect(() => {   // que Android no borre la cola por falta de espacio
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* */ }
+  }, []);
+
+  useEffect(() => {   // service worker: abre sin señal; avisa cuando hay versión nueva
+    if (!('serviceWorker' in navigator)) return;
+    let recargando = false;
+    const habiaVersion = !!navigator.serviceWorker.controller;   // en la primera instalación no se recarga
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (habiaVersion && !recargando) { recargando = true; window.location.reload(); } });
+    navigator.serviceWorker.register('./sw.js').then((reg) => {
+      const revisar = (w) => { if (w && navigator.serviceWorker.controller) setSwEspera(w); };
+      if (reg.waiting) revisar(reg.waiting);
+      reg.addEventListener('updatefound', () => {
+        const w = reg.installing;
+        if (w) w.addEventListener('statechange', () => { if (w.state === 'installed') revisar(w); });
+      });
+      setInterval(() => { if (navigator.onLine !== false) reg.update().catch(() => {}); }, 30 * 60000);   // busca versión nueva cada 30 min
+    }).catch(() => { /* sin service worker la app funciona igual, pero no abre sin señal */ });
+  }, []);
+
+  const aviso_ = swEspera && <AvisoVersion onActualizar={() => swEspera.postMessage('SKIP_WAITING')} />;
+  if (conServidor && !token) {
+    return <>{aviso_}<ConfigurarToken aviso={aviso} onGuardar={(x) => { guardarToken(x); setAviso(''); setToken(x); }} /></>;
+  }
+  return <>{aviso_}<App key={token} onCambiarToken={conServidor ? () => { borrarToken(); setAviso(''); setToken(''); } : null} /></>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Raiz />);

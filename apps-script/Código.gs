@@ -13,7 +13,13 @@
  *                  La reescribe actualizarPanel() cada hora. Config tipo "feriado" (aaaa-mm-dd) = día inhábil.
  *
  * Instalación: ejecutar setup() una vez, luego Implementar > Nueva implementación > Aplicación web
- * (Ejecutar como: Yo · Acceso: solo usuarios del dominio institucional).
+ * (Ejecutar como: Yo · Acceso: Cualquier usuario).
+ *
+ * La app de las tablets es una PWA en GitHub Pages (ver CLAUDE.md). Habla con este script SOLO por doPost(),
+ * con un token por tablet. Las funciones que tocan la planilla terminan en "_" (privadas): google.script.run
+ * no puede llamarlas y el editor no las muestra para ejecutar. NO quitar el guion bajo final.
+ * Para publicar un cambio: Implementar > Gestionar implementaciones > (lápiz) > Versión: Nueva versión.
+ * NUNCA "Nueva implementación": cambia la URL /exec y las tablets quedan sin servidor.
  */
 
 const PREFIJO_FOLIO = 'D-';
@@ -57,11 +63,184 @@ const FERIADOS = [
   '2027-08-15', '2027-09-18', '2027-09-19', '2027-10-11', '2027-10-31', '2027-11-01', '2027-12-08', '2027-12-25'];
 
 /* ------------------------------------------------------------------ */
+/* Dirección de la app (PWA). La página antigua de Apps Script ya no sirve la bitácora: solo muestra este enlace. */
+const APP_URL = 'https://subdirecionhfrutillar.github.io/Bitacora/bitacora/';
+
 function doGet() {
-  return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle('Bitácora de traslados HF')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.DEFAULT);
+  const html = '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>Bitácora de Ambulancia HF</title></head><body style="margin:0;font:18px/1.5 Roboto,Arial,sans-serif;background:#F2F5F9;color:#001C41">' +
+    '<div style="display:flex;height:8px"><div style="width:33%;background:#0F69C4"></div><div style="flex:1;background:#EB3C46"></div></div>' +
+    '<main style="max-width:520px;margin:10vh auto;padding:0 20px;text-align:center"><p>Servicio de Salud del Reloncaví · Hospital de Frutillar</p>' +
+    '<h1 style="font-size:26px">La Bitácora de Ambulancia cambió de dirección</h1>' +
+    '<p>La bitácora ahora se instala en la tablet y abre aunque no haya señal.</p>' +
+    '<p><a href="' + APP_URL + '" target="_top" style="display:inline-block;padding:16px 28px;background:#0F69C4;color:#fff;border-radius:6px;font-weight:700;text-decoration:none">Abrir la nueva bitácora</a></p>' +
+    '<p style="font-size:15px;color:#4A5A70">Antes de cambiar, envíe los registros pendientes de la app anterior. La tablet necesita su token: pídalo a Subdirección.</p>' +
+    '</main></body></html>';
+  return HtmlService.createHtmlOutput(html).setTitle('Bitácora de Ambulancia HF')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/* ------------------------------------------------------------------
+ * API para la app de las tablets. ÚNICA puerta de entrada.
+ * Pedido (text/plain con JSON): { fn, args, token, dispositivo, version }
+ * Respuesta (JSON): { data } o { error, codigo }   codigo: PEDIDO · TOKEN_INVALIDO · FN_NO_PERMITIDA · ERROR
+ * - El token se valida ANTES de cualquier lock o lectura de la planilla (un pedido sin token no gasta nada).
+ * - Siempre responde JSON: una excepción nunca sale como página de error de Google.
+ * ------------------------------------------------------------------ */
+const API = {
+  getConfig: function () { return getConfig_(); },
+  syncEventos: function (a, origen) { return syncEventos_(a[0], origen); },
+  agregarPersona: function (a) { return agregarPersona_(a[0]); },
+  anularTraslado: function (a, origen) { return anularTraslado_(a[0], origen); },
+  getEstadoMoviles: function () { return getEstadoMoviles_(); },
+  getTrasladosDia: function (a) { return getTrasladosDia_(a[0]); },
+};
+
+function doPost(e) {
+  let pedido;
+  try {
+    pedido = JSON.parse((e && e.postData && e.postData.contents) || '');
+    if (!pedido || typeof pedido !== 'object') throw new Error('vacío');
+  } catch (err) {
+    return json_({ error: 'Pedido no válido', codigo: 'PEDIDO' });
+  }
+  try {
+    const tok = validarToken_(pedido.token);
+    if (!tok) {
+      contarRechazo_();
+      return json_({ error: 'El token de esta tablet no es válido o fue revocado. Pida uno nuevo a Subdirección.', codigo: 'TOKEN_INVALIDO' });
+    }
+    const fn = String(pedido.fn || '');
+    if (!Object.prototype.hasOwnProperty.call(API, fn)) return json_({ error: 'Función no permitida: ' + fn.slice(0, 40), codigo: 'FN_NO_PERMITIDA' });
+    const origen = { token: tok.nombre, dispositivo: String(pedido.dispositivo || '').slice(0, 40) };
+    const data = API[fn](Array.isArray(pedido.args) ? pedido.args : [], origen);
+    marcarContacto_(tok.clave, origen.dispositivo, pedido.version);
+    return json_({ data: data === undefined ? null : data });
+  } catch (err) {
+    console.error('doPost ' + (pedido && pedido.fn) + ': ' + (err && err.stack || err));
+    return json_({ error: String((err && err.message) || err), codigo: 'ERROR' });
+  }
+}
+
+function json_(obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); }
+
+/* ---------------- tokens por tablet ----------------
+ * Propiedades del script, clave "tokens": { token: { nombre, activo, creado, revocado?, ultimo?, dispositivo?, version? } }
+ * Se crean y revocan desde el editor con ADMIN_crearToken / ADMIN_revocarToken / ADMIN_listarTokens (más abajo). */
+function leerTokens_() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('tokens') || '{}'); } catch (err) { return {}; }
+}
+function guardarTokens_(t) { PropertiesService.getScriptProperties().setProperty('tokens', JSON.stringify(t)); }
+
+function validarToken_(token) {
+  token = String(token || '');
+  if (!/^[A-Za-z0-9_-]{20,128}$/.test(token)) return null;
+  const t = leerTokens_()[token];
+  return t && t.activo === true ? { clave: token, nombre: String(t.nombre || 'tablet') } : null;
+}
+
+/* Devuelve el token UNA sola vez (no se puede volver a ver: si se pierde, se crea otro y se revoca el anterior) */
+function crearTokenTablet_(nombre) {
+  nombre = String(nombre || '').trim();
+  if (!nombre) throw new Error('Indique un nombre para la tablet (ej. "Tablet Móvil 01")');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const t = leerTokens_();
+    const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+    t[token] = { nombre: nombre, activo: true, creado: new Date().toISOString() };
+    guardarTokens_(t);
+    return token;
+  } finally { lock.releaseLock(); }
+}
+
+/* Acepta el token completo o su comienzo (mín. 8 caracteres, como lo muestra ADMIN_listarTokens) */
+function revocarTokenTablet_(token) {
+  token = String(token || '').trim();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const t = leerTokens_();
+    const claves = Object.keys(t).filter(function (k) { return k === token || (token.length >= 8 && k.indexOf(token) === 0); });
+    if (claves.length !== 1) throw new Error(claves.length ? 'Hay más de un token que empieza así: escriba más caracteres' : 'No existe ese token');
+    t[claves[0]].activo = false;
+    t[claves[0]].revocado = new Date().toISOString();
+    guardarTokens_(t);
+    return t[claves[0]].nombre;
+  } finally { lock.releaseLock(); }
+}
+
+/* Último contacto de cada tablet (como mucho una escritura cada 10 min por token) */
+function marcarContacto_(clave, dispositivo, version) {
+  try {
+    const cache = CacheService.getScriptCache();
+    if (cache.get('contacto_' + clave)) return;
+    cache.put('contacto_' + clave, '1', 600);
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(2000)) return;
+    try {
+      const t = leerTokens_();
+      if (!t[clave]) return;
+      t[clave].ultimo = new Date().toISOString();
+      t[clave].dispositivo = dispositivo || t[clave].dispositivo || '';
+      t[clave].version = String(version || '').slice(0, 30);
+      guardarTokens_(t);
+    } finally { lock.releaseLock(); }
+  } catch (err) { console.warn('marcarContacto_: ' + err); }
+}
+
+/* Pedidos rechazados por token (para detectar abuso). Solo caché: no escribe en la planilla ni en propiedades. */
+function contarRechazo_() {
+  try {
+    const cache = CacheService.getScriptCache();
+    const n = Number(cache.get('rechazos') || 0) + 1;
+    cache.put('rechazos', String(n), 21600);
+    if (n % 50 === 0) console.warn('Bitácora: ' + n + ' pedidos con token inválido en las últimas horas');
+  } catch (err) { /* sin caché: no se cuenta */ }
+}
+
+/* ===== ADMINISTRACIÓN DE TABLETS — ejecutar desde el editor (menú "Ejecutar") =====
+ * 1) Escriba el nombre o el token en la constante de abajo, 2) guarde, 3) elija la función y pulse Ejecutar,
+ * 4) lea el resultado en "Registro de ejecución". */
+const ADMIN_NOMBRE_TABLET = 'Tablet Móvil 01';
+const ADMIN_TOKEN_A_REVOCAR = '';
+
+function ADMIN_crearToken() {
+  soloEditor_();
+  const token = crearTokenTablet_(ADMIN_NOMBRE_TABLET);
+  const enlace = APP_URL + '#t=' + token;
+  console.log('Token para "' + ADMIN_NOMBRE_TABLET + '" (se muestra UNA sola vez):\n' + token +
+    '\n\nEnlace de alta (ábralo en la tablet):\n' + enlace +
+    '\n\nCódigo QR para escanear con la tablet (se genera en su navegador, el token no sale a internet):\n' +
+    APP_URL + 'qr.html#t=' + token);
+  return token;
+}
+
+function ADMIN_revocarToken() {
+  soloEditor_();
+  const nombre = revocarTokenTablet_(ADMIN_TOKEN_A_REVOCAR);
+  console.log('Revocado: "' + nombre + '". Desde ahora esa tablet no puede enviar ni leer nada.');
+  return nombre;
+}
+
+function ADMIN_listarTokens() {
+  soloEditor_();
+  const t = leerTokens_();
+  const filas = Object.keys(t).map(function (k) {
+    const x = t[k];
+    return (x.activo ? 'ACTIVO   ' : 'REVOCADO ') + k.slice(0, 8) + '…  ' + x.nombre + '  · creado ' + x.creado +
+      (x.ultimo ? '  · último contacto ' + x.ultimo + ' (' + (x.dispositivo || '') + ', v' + (x.version || '?') + ')' : '  · sin contacto aún') +
+      (x.revocado ? '  · revocado ' + x.revocado : '');
+  });
+  console.log(filas.length ? filas.join('\n') : 'No hay tokens. Cree uno con ADMIN_crearToken.');
+  return filas.length;
+}
+
+/* Las funciones ADMIN_ solo corren desde el editor por el dueño (no desde la web) */
+function soloEditor_() {
+  let activo = '', efectivo = '';
+  try { activo = Session.getActiveUser().getEmail(); efectivo = Session.getEffectiveUser().getEmail(); } catch (err) { /* */ }
+  if (!activo || activo !== efectivo) throw new Error('Ejecute esta función desde el editor de Apps Script con la cuenta dueña.');
 }
 
 /* Ejecutar UNA vez desde el editor */
@@ -243,7 +422,7 @@ function minutosInhabiles_(ini, fin, feriados, tz) {
 function letra_(i) { let s = ''; i += 1; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
 
 /* ------------------------------------------------------------------ */
-function getConfig() {
+function getConfig_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const personal = personalActivo_(ss);
   const cfg = filas_(ss.getSheetByName('Config'));
@@ -273,7 +452,7 @@ function getConfig() {
  * - Asigna folio correlativo central al crear el traslado.
  * - Guarda hora del dispositivo y hora del servidor.
  * ------------------------------------------------------------------ */
-function syncEventos(lote) {
+function syncEventos_(lote, origen) {
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
@@ -298,6 +477,7 @@ function syncEventos(lote) {
     const ahora = new Date();
     let cuenta = '';
     try { cuenta = Session.getActiveUser().getEmail(); } catch (err) { cuenta = ''; }
+    if (!cuenta) cuenta = cuentaOrigen_(origen);
     const ok = [], folios = {}, nuevasFilasE = [], rechazados = [];
 
     (lote || []).forEach(function (e) {
@@ -422,7 +602,7 @@ function actualizarBitacora() {
  * Estado de cada móvil para la pestaña "Móviles" (Urgencia): en base o fuera, con la etapa del traslado en curso.
  * Solo lee. El dato es el último recibido de la tablet del móvil (columna actualizado_servidor).
  * ------------------------------------------------------------------ */
-function getEstadoMoviles() {
+function getEstadoMoviles_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone();
   const h = HOJAS.Traslados;
@@ -460,7 +640,7 @@ function getEstadoMoviles() {
 /* ------------------------------------------------------------------
  * Traslados de un día (aaaa-mm-dd), de todos los equipos, para la lista de la app.
  * ------------------------------------------------------------------ */
-function getTrasladosDia(fecha) {
+function getTrasladosDia_(fecha) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone();
   const h = HOJAS.Traslados;
@@ -483,7 +663,7 @@ function getTrasladosDia(fecha) {
  * Anular un traslado desde cualquier tablet (con señal). Queda como evento ANULAR en Eventos,
  * con quién, desde qué equipo y con qué cuenta. Un traslado anulado no vuelve a otro estado.
  * ------------------------------------------------------------------ */
-function anularTraslado(p) {
+function anularTraslado_(p, origen) {
   const motivo = String((p && p.motivo) || '').trim();
   if (!p || !p.trasladoId) throw new Error('Falta el traslado');
   if (motivo.length < 5) throw new Error('El motivo debe tener al menos 5 caracteres');
@@ -504,6 +684,7 @@ function anularTraslado(p) {
     const ahora = new Date();
     let cuenta = '';
     try { cuenta = Session.getActiveUser().getEmail(); } catch (err) { cuenta = ''; }
+    if (!cuenta) cuenta = cuentaOrigen_(origen);
     const desde = shE.getLastRow() + 1;
     shE.getRange(desde, 1, 1, HOJAS.Eventos.length).setValues([[ahora, ahora, 0, 'srv-' + Utilities.getUuid(), String(p.dispositivo || ''), String(p.usuario || ''),
       r[h.indexOf('movil')], p.trasladoId, r[h.indexOf('folio')], 'ANULAR', 'estado', anterior, 'anulado', motivo, cuenta]]);
@@ -528,7 +709,7 @@ function anularTraslado(p) {
  * - LockService: dos tablets agregando a la vez no generan duplicados.
  * Devuelve { nombre, rol, existente, personal } con la lista actualizada para todos los equipos.
  * ------------------------------------------------------------------ */
-function agregarPersona(p) {
+function agregarPersona_(p) {
   const rol = String((p && p.rol) || '').trim();
   if (rol !== 'Conductor' && rol !== 'TENS') throw new Error('Rol no válido');
   const nombre = normalizarNombre_((p && p.nombre) || '');
@@ -574,6 +755,12 @@ function normalizarNombre_(s) {
 /* Clave para comparar nombres: sin tildes, sin mayúsculas, espacios simples */
 function claveNombre_(s) {
   return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/* Sin cuenta Google (pedido desde la PWA): queda el nombre del token y el ID de la tablet en la columna cuenta_google */
+function cuentaOrigen_(origen) {
+  if (!origen) return '';
+  return ('token:' + String(origen.token || '') + (origen.dispositivo ? ' · ' + origen.dispositivo : '')).slice(0, 120);
 }
 
 /* Turno del equipo completo: móvil, quién registra, chofer y TENS */
